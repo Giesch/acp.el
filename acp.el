@@ -513,7 +513,8 @@ When non-nil SYNC, send notification synchronously."
 (cl-defun acp-make-initialize-request (&key protocol-version
                                             client-info
                                             read-text-file-capability
-                                            write-text-file-capability)
+                                            write-text-file-capability
+                                            elicitation-form-capability)
   "Instantiate an \"initialize\" request.
 
 PROTOCOL-VERSION is the version of the ACP protocol to use.
@@ -523,6 +524,11 @@ READ-TEXT-FILE-CAPABILITY is a boolean indicating if the client
 can read text files.
 WRITE-TEXT-FILE-CAPABILITY is a boolean indicating if the client
 can write text files.
+ELICITATION-FORM-CAPABILITY is a boolean indicating if the client
+can render \"elicitation/create\" requests with a \"form\" mode.
+When nil, the capability is omitted from the request.
+
+Note: The elicitation capability is an unstable ACP feature.
 
 See https://agentclientprotocol.com/protocol/schema#initializerequest
 and https://agentclientprotocol.com/protocol/schema#initializeresponse."
@@ -537,7 +543,11 @@ and https://agentclientprotocol.com/protocol/schema#initializeresponse."
                                                                  :false))
                                               (writeTextFile . ,(if write-text-file-capability
                                                                     t
-                                                                  :false))))))))))
+                                                                  :false))))
+                                       ;; An empty object marks the mode as
+                                       ;; supported. A boolean is rejected.
+                                       ,@(when elicitation-form-capability
+                                           '((elicitation . ((form . nil)))))))))))
 
 (cl-defun acp-make-authenticate-request (&key method-id method)
   "Instantiate an \"authenticate\" request.
@@ -759,6 +769,55 @@ See https://agentclientprotocol.com/protocol/schema#requestpermissionresponse."
                                  '((outcome . "cancelled"))
                                `((outcome . "selected")
                                  (optionId . ,option-id))))))))
+
+(defun acp--elicitation-content-value-p (value)
+  "Return non-nil if VALUE is a valid \"elicitation/create\" content value."
+  (or (stringp value)
+      (numberp value)
+      (eq value t)
+      (eq value :false)
+      (and (vectorp value)
+           (seq-every-p #'stringp value))))
+
+(cl-defun acp-make-elicitation-create-response (&key request-id action content error)
+  "Instantiate an \"elicitation/create\" response.
+
+REQUEST-ID is the ID of the request this is a response to.
+ACTION is one of \"accept\", \"decline\", or \"cancel\".
+CONTENT is an alist of field name to value, valid with an \"accept\"
+ACTION only.  Each value must be a string, a number, t, :false, or a
+vector of strings.  A list value serializes as a JSON object and the
+agent discards the whole content, so vectors are required for
+multi-select answers.
+Provide either ACTION or ERROR, but not both.
+
+Note: This is an unstable ACP feature.
+
+See https://agentclientprotocol.com/protocol/schema#createelicitationresponse."
+  (unless request-id
+    (error ":request-id is required"))
+  (when (and action error)
+    (error "Choose :action or :error Not both"))
+  (unless (or action error)
+    (error "Must specify either :action or :error"))
+  (when (and content error)
+    (error "Choose :content or :error Not both"))
+  (when action
+    (unless (member action '("accept" "decline" "cancel"))
+      (error "Unknown :action %S" action))
+    (when (and content (not (equal action "accept")))
+      (error ":content is only valid with an \"accept\" :action"))
+    (map-do (lambda (field value)
+              (unless (acp--elicitation-content-value-p value)
+                (error "Invalid :content value for %S: %S" field value)))
+            content))
+  (if error
+      `((:request-id . ,request-id)
+        (:error . ,error))
+    `((:request-id . ,request-id)
+      (:result . ((action . ,action)
+                  ,@(when content
+                      `((content . ,content))))))))
 
 (cl-defun acp-make-fs-read-text-file-response (&key request-id content error)
   "Instantiate a \"fs/read_text_file\" response.

@@ -49,13 +49,14 @@ Eeach message is of the form:
                                                  :on-success on-success
                                                  :on-failure on-failure)))
                  :response-sender
-                 (cl-function (lambda (&key _client response)
-                                (acp-fakes--response-sender :response response)))
+                 (cl-function (lambda (&key client response)
+                                (acp-fakes--response-sender :client client :response response)))
                  :request-resolver
                  (cl-function (lambda (&key client id)
                                 (acp-fakes--request-resolver :client client :id id))))))
     (setf (map-elt client :message-queue) (copy-sequence messages))
     (setf (map-elt client :pending-requests) '())
+    (setf (map-elt client :sent-responses) '())
     client))
 
 (cl-defun acp-fakes--request-sender (&key client _request on-success on-failure)
@@ -123,10 +124,16 @@ Eeach message is of the form:
            (t
             (error "No matching response found for request %s" request-id))))))))
 
-(cl-defun acp-fakes--response-sender (&key _response)
-  "Fake response sender."
-  ;; Nothing left to do after sending.
-  (ignore))
+(cl-defun acp-fakes--response-sender (&key client response)
+  "Record RESPONSE sent by CLIENT."
+  (unless client
+    (error ":client is required"))
+  (setf (map-elt client :sent-responses)
+        (append (map-elt client :sent-responses) (list response))))
+
+(defun acp-fakes-sent-responses (client)
+  "Return the responses CLIENT sent, in send order."
+  (map-elt client :sent-responses))
 
 (cl-defun acp-fakes--request-resolver (&key _client _id)
   "Fake request resolver."

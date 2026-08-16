@@ -140,6 +140,7 @@ The =*acp traffic*= is particularly useful to inspecting incomng or outgoing tra
 | acp-logs-buffer                              | Get CLIENT logs buffer.                              |
 | acp-make-authenticate-request                | Instantiate an "authenticate" request.               |
 | acp-make-client                              | Create an ACP client.                                |
+| acp-make-elicitation-create-response         | Instantiate an "elicitation/create" response.        |
 | acp-make-error                               | Create a JSON-RPC error object.                      |
 | acp-make-fs-read-text-file-response          | Instantiate a "fs/read_text_file" response.          |
 | acp-make-fs-write-text-file-response         | Instantiate a "fs/write_text_file" response.         |

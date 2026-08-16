@@ -1,16 +1,20 @@
 ;;; acp-test.el --- Tests for acp.el -*- lexical-binding: t; -*-
 
 ;;; Commentary:
-;; Tests for ACP log buffer trimming behavior.
+;; Tests for acp.el.
 ;;
-;; The trimming logic should enforce byte limits while preserving whole
-;; log messages using boundary markers.
+;; Log buffer trimming enforces byte limits while preserving whole log
+;; messages using boundary markers.
+;;
+;; Request and response builders are tested through their serialized JSON,
+;; since the agent reads the wire format rather than the alist.
 
 ;;; Code:
 
 (require 'ert)
 (setq load-prefer-newer t)
 (require 'acp)
+(require 'acp-fakes)
 
 (defun acp-test--format-log-message (message)
   "Return a formatted log message for MESSAGE."
@@ -77,6 +81,88 @@
       (when-let ((process (map-elt client :process))
                  ((process-live-p process)))
         (delete-process process)))))
+
+(defun acp-test--initialize-capabilities (&rest args)
+  "Return `clientCapabilities' of an initialize request built with ARGS."
+  (map-nested-elt (apply #'acp-make-initialize-request :protocol-version 1 args)
+                  '(:params clientCapabilities)))
+
+(ert-deftest acp-test-initialize-request-omits-elicitation-by-default ()
+  "Omit the elicitation capability unless it is asked for."
+  (let ((capabilities (acp-test--initialize-capabilities)))
+    (should (map-contains-key capabilities 'fs))
+    (should-not (map-contains-key capabilities 'elicitation))
+    (should-not (string-search "elicitation" (json-serialize capabilities)))))
+
+(ert-deftest acp-test-initialize-request-elicitation-form-is-an-object ()
+  "Serialize the form capability as an object.
+Agents gate on the value being an object.  A boolean fails their
+schema check and disables the capability."
+  (let ((capabilities (acp-test--initialize-capabilities
+                       :elicitation-form-capability t)))
+    (should (map-contains-key (map-elt capabilities 'elicitation) 'form))
+    (should (string-search "\"elicitation\":{\"form\":{}}"
+                           (json-serialize capabilities)))))
+
+(ert-deftest acp-test-elicitation-create-response-accept ()
+  "Serialize an accepted form, including a multi-select answer."
+  (let ((response (acp-make-elicitation-create-response
+                   :request-id 7
+                   :action "accept"
+                   :content '((question_0 . "JWT")
+                              (question_1 . ["Tests" "Docs"])))))
+    (should (equal (map-elt response :request-id) 7))
+    (should (equal (json-serialize (map-elt response :result))
+                   (concat "{\"action\":\"accept\","
+                           "\"content\":{\"question_0\":\"JWT\","
+                           "\"question_1\":[\"Tests\",\"Docs\"]}}")))))
+
+(ert-deftest acp-test-elicitation-create-response-without-content ()
+  "Omit the content key when there is no content."
+  (dolist (action '("accept" "decline" "cancel"))
+    (let ((response (acp-make-elicitation-create-response
+                     :request-id 1 :action action)))
+      (should (equal (json-serialize (map-elt response :result))
+                     (format "{\"action\":\"%s\"}" action))))))
+
+(ert-deftest acp-test-elicitation-create-response-error ()
+  "Build an error response instead of a result."
+  (let ((response (acp-make-elicitation-create-response
+                   :request-id 1
+                   :error (acp-make-error :code -32603 :message "Boom"))))
+    (should (map-contains-key response :error))
+    (should-not (map-contains-key response :result))))
+
+(ert-deftest acp-test-elicitation-create-response-rejects-invalid-arguments ()
+  "Reject argument combinations the agent would silently discard."
+  (should-error (acp-make-elicitation-create-response :action "accept"))
+  (should-error (acp-make-elicitation-create-response :request-id 1))
+  (should-error (acp-make-elicitation-create-response
+                 :request-id 1 :action "accept"
+                 :error '((code . -32603) (message . "Boom"))))
+  (should-error (acp-make-elicitation-create-response
+                 :request-id 1 :action "dismiss"))
+  (should-error (acp-make-elicitation-create-response
+                 :request-id 1 :action "decline"
+                 :content '((question_0 . "JWT"))))
+  ;; A list serializes as a JSON object, which fails the agent's schema
+  ;; check and drops every answer without an error.
+  (should-error (acp-make-elicitation-create-response
+                 :request-id 1 :action "accept"
+                 :content '((question_0 "Tests" "Docs")))))
+
+(ert-deftest acp-test-fake-client-records-sent-responses ()
+  "Record responses sent through a fake client."
+  (let* ((client (acp-fakes-make-client nil))
+         (declined (acp-make-elicitation-create-response
+                    :request-id 1 :action "decline"))
+         (cancelled (acp-make-elicitation-create-response
+                     :request-id 2 :action "cancel")))
+    (should-not (acp-fakes-sent-responses client))
+    (acp-send-response :client client :response declined)
+    (acp-send-response :client client :response cancelled)
+    (should (equal (acp-fakes-sent-responses client)
+                   (list declined cancelled)))))
 
 (provide 'acp-test)
 
