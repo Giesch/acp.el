@@ -87,6 +87,8 @@ Each message is of the form:
     ;; pending requests kept in acp's shape, keyed by recorded id.
     (setf (map-elt client :message-queue) (copy-sequence messages))
     (setf (map-elt client :pending-requests) '())
+    (setf (map-elt client :sent-requests) '())
+    (setf (map-elt client :sent-notifications) '())
     (setf (map-elt client :sent-responses) '())
     (setf (map-elt client :traffic) (vconcat messages))
     (setf (map-elt client :cursor) 0)
@@ -212,6 +214,8 @@ pump reaches it -- keeping the request in flight, and its notifications in
 turn, until then."
   (unless client
     (error ":client is required"))
+  (setf (map-elt client :sent-requests)
+        (append (map-elt client :sent-requests) (list request)))
   (let* ((method (map-elt request :method))
          (recorded (acp-fakes--claim-outgoing
                     client
@@ -250,6 +254,8 @@ prompt), so it is matched by the id it replies to."
   "Claim the recorded counterpart of NOTIFICATION and resume CLIENT's replay."
   (unless client
     (error ":client is required"))
+  (setf (map-elt client :sent-notifications)
+        (append (map-elt client :sent-notifications) (list notification)))
   (let ((method (map-elt notification :method)))
     (acp-fakes--claim-outgoing
      client
@@ -257,6 +263,14 @@ prompt), so it is matched by the id it replies to."
        (and (eq (map-elt message :kind) 'notification)
             (equal (map-nested-elt message '(:object method)) method)))))
   (acp-fakes-pump client))
+
+(defun acp-fakes-sent-requests (client)
+  "Return the requests CLIENT sent, in send order."
+  (map-elt client :sent-requests))
+
+(defun acp-fakes-sent-notifications (client)
+  "Return the notifications CLIENT sent, in send order."
+  (map-elt client :sent-notifications))
 
 (defun acp-fakes-sent-responses (client)
   "Return the responses CLIENT sent, in send order."

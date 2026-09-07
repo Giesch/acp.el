@@ -164,6 +164,23 @@ schema check and disables the capability."
     (should (equal (acp-fakes-sent-responses client)
                    (list declined cancelled)))))
 
+(ert-deftest acp-test-fake-client-records-sent-requests ()
+  "Record requests and notifications sent through a fake client."
+  (let* ((client (acp-fakes-make-client nil))
+         (prompt (acp-make-session-prompt-request
+                  :session-id "s1"
+                  :prompt [("type" . "text") ("text" . "hello")]))
+         (cancel (acp-make-session-cancel-notification
+                  :session-id "s1" :reason "done")))
+    (should-not (acp-fakes-sent-requests client))
+    (unwind-protect
+        (progn
+          (acp-send-request :client client :request prompt)
+          (acp-send-notification :client client :notification cancel)
+          (should (equal (acp-fakes-sent-requests client) (list prompt)))
+          (should (equal (acp-fakes-sent-notifications client) (list cancel))))
+      (acp-shutdown :client client))))
+
 (defun acp-test--exited-client ()
   "Return a started client whose process has since exited."
   (let* ((client (acp-make-client :command "cat"))
