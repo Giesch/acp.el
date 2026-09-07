@@ -36,7 +36,11 @@ summary string with total, completed, unexpected, and skipped counts."
       (load (expand-file-name file root) nil t))
     (dolist (file (directory-files (expand-file-name "tests" root) t "\\.el\\'"))
       (load file nil t))
-    (let* ((stats (ert-run-tests-batch selector))
+    ;; Failure reporting visits test files for source locations; a
+    ;; dir-locals prompt there would hang a frameless daemon.
+    (let* ((enable-local-variables nil)
+           (enable-dir-local-variables nil)
+           (stats (ert-run-tests-batch selector))
            (tests (ert--stats-tests stats))
            (results (mapcar #'ert-test-most-recent-result tests))
            (pairs (seq-mapn #'cons tests results))
