@@ -97,6 +97,9 @@ the error is logged."
         (cons :notification-handlers ())
         (cons :request-handlers ())
         (cons :error-handlers ())
+        (cons :disconnect-handlers ())
+        (cons :connection-generation (make-symbol "acp-connection"))
+        (cons :closed nil)
         (cons :request-sender (or request-sender #'acp--request-sender))
         (cons :notification-sender (or notification-sender #'acp--notification-sender))
         (cons :request-resolver (or request-resolver #'acp--request-resolver))
@@ -119,7 +122,11 @@ the error is logged."
     (error "\"%s\" command line utility not found.  Please install it" (map-elt client :command)))
   (when (acp--client-started-p client)
     (error "Client already started"))
-  (let* ((coding-system-for-read 'utf-8-unix)
+  (when (map-elt client :closed)
+    (map-put! client :connection-generation (make-symbol "acp-connection")))
+  (map-put! client :closed nil)
+  (let* ((generation (map-elt client :connection-generation))
+         (coding-system-for-read 'utf-8-unix)
          (coding-system-for-write 'utf-8-unix)
          (pending-input "")
          (message-queue nil)
@@ -174,7 +181,9 @@ the error is logged."
                                         (setq message-queue-busy t)
                                         (run-at-time 0 nil
                                                      (lambda ()
-                                                       (while message-queue
+                                                       (while (and message-queue
+                                                                   (eq generation (map-elt client :connection-generation))
+                                                                   (not (map-elt client :closed)))
                                                          ;; Bind print variables so the debugger
                                                          ;; can safely print the client alist
                                                          ;; without infinite recursion (#360).
@@ -211,7 +220,9 @@ the error is logged."
                     :sentinel (lambda (process event)
                                 (when (buffer-live-p stderr-buffer)
                                   (kill-buffer stderr-buffer))
-                                (when (memq (process-status process) '(exit signal))
+                                (when (and (memq (process-status process) '(exit signal))
+                                           (eq generation (map-elt client :connection-generation)))
+                                  (acp--notify-disconnected client)
                                   (acp--fail-pending-requests :client client :event event))))))
       (map-put! client :process process))))
 
@@ -340,6 +351,20 @@ Note: These are agent process errors.
           handlers)
     (map-put! client :error-handlers handlers)))
 
+(defun acp--notify-disconnected (client)
+  "Notify CLIENT subscribers once when its connection ends."
+  (unless (map-elt client :closed)
+    (map-put! client :closed t)
+    (dolist (handler (map-elt client :disconnect-handlers))
+      (condition-case nil (funcall handler) (error nil)))))
+
+(cl-defun acp-subscribe-to-disconnect (&key client on-disconnect)
+  "Call ON-DISCONNECT without arguments when CLIENT's connection ends."
+  (unless (and client on-disconnect)
+    (error ":client and :on-disconnect are required"))
+  (setf (map-elt client :disconnect-handlers)
+        (cons on-disconnect (map-elt client :disconnect-handlers))))
+
 (cl-defun acp-shutdown (&key client)
   "Shutdown ACP CLIENT and release resources.
 
@@ -348,6 +373,8 @@ Each resource is released independently, so a partially torn down client
 never started) is still fully released.  Safe to call repeatedly."
   (unless client
     (error ":client is required"))
+  (acp--notify-disconnected client)
+  (map-put! client :disconnect-handlers nil)
   (map-put! client :error-handlers nil)
   (map-put! client :notification-handlers nil)
   (map-put! client :request-handlers nil)
@@ -456,7 +483,10 @@ SYNC: When non-nil, send request synchronously."
         result))))
 
 (cl-defun acp-send-response (&key client response)
-  "Send a request RESPONSE from CLIENT."
+  "Send a request RESPONSE from CLIENT.
+
+A :log-result entry replaces :result in traffic logs only.  The transport
+always serializes :result; callers must provide an independent safe copy."
   (unless client
     (error ":client is required"))
   (unless response
@@ -473,7 +503,10 @@ SYNC: When non-nil, send request synchronously."
     (error ":response is required"))
   (let* ((request-id (map-elt response :request-id))
          (result-data (map-elt response :result))
-         (error-data (map-elt response :error)))
+         (error-data (map-elt response :error))
+         (log-result (if (map-contains-key response :log-result)
+                         (map-elt response :log-result)
+                       (map-elt response :result))))
     (let* ((proc (map-elt client :process))
            (response (if error-data
                          `((jsonrpc . ,acp--jsonrpc-version)
@@ -483,7 +516,11 @@ SYNC: When non-nil, send request synchronously."
                          (id . ,request-id)
                          (result . ,result-data)))))
       (let ((json (acp--serialize-json response)))
-        (acp--log-traffic client 'outgoing 'response (acp--make-message :object response :json json))
+        (let ((projection (copy-tree response t)))
+          (unless error-data (setf (map-elt projection 'result) log-result))
+          (acp--log-traffic client 'outgoing 'response
+                            (acp--make-message :object projection
+                                               :json (acp--serialize-json projection))))
         (process-send-string proc json)))))
 
 (cl-defun acp--notification-sender (&key client notification sync)
@@ -816,9 +853,9 @@ See https://agentclientprotocol.com/protocol/schema#createelicitationresponse."
       (error "Unknown :action %S" action))
     (when (and content (not (equal action "accept")))
       (error ":content is only valid with an \"accept\" :action"))
-    (map-do (lambda (field value)
+    (map-do (lambda (_field value)
               (unless (acp--elicitation-content-value-p value)
-                (error "Invalid :content value for %S: %S" field value)))
+                (error "Invalid elicitation content value")))
             content))
   (if error
       `((:request-id . ,request-id)
@@ -1119,8 +1156,13 @@ DIRECTION is either `incoming' or `outgoing', OBJECT is the parsed object."
     (setq acp-instance-count (1+ acp-instance-count))))
 
 (defun acp--parse-json (json)
-  "Parse JSON using a consistent configuration."
-  (json-parse-string json :object-type 'alist :null-object nil :false-object nil))
+  "Parse JSON, preserving schema Booleans and null in elicitation requests.
+
+Other messages retain the legacy nil representation for false and null."
+  (let ((object (json-parse-string json :object-type 'alist :null-object nil :false-object nil)))
+    (if (equal (map-elt object 'method) "elicitation/create")
+        (json-parse-string json :object-type 'alist :null-object :null :false-object :false)
+      object)))
 
 (defun acp--serialize-json (object)
   "Serialize OBJECT to JSON using a consistent configuration."
