@@ -36,12 +36,36 @@
       (when (buffer-live-p log-buffer)
         (kill-buffer log-buffer)))))
 
+(ert-deftest acp-test-stderr-preserves-whitespace-only-chunks ()
+  "Forward stderr chunks unchanged so consumers can concatenate them."
+  (let ((client (acp-make-client :command "cat"))
+        (acp-logging-enabled nil)
+        (chunks '("hello" " " "world" "\n" "\t" "next\n"))
+        stderr-buffer received)
+    (acp-subscribe-to-errors
+     :client client
+     :on-error (lambda (error-data)
+                 (should (= (map-elt error-data 'code) -32603))
+                 (push (map-elt error-data 'message) received)))
+    (unwind-protect
+        (progn
+          (cl-letf (((symbol-function 'make-process)
+                     (lambda (&rest args)
+                       (setq stderr-buffer (plist-get args :stderr))
+                       nil)))
+            (acp--start-client :client client))
+          (with-current-buffer stderr-buffer
+            (dolist (chunk chunks)
+              (insert chunk)))
+          (should (equal (nreverse received) chunks)))
+      (when (buffer-live-p stderr-buffer)
+        (kill-buffer stderr-buffer)))))
+
 (ert-deftest acp-test-trim-log-buffer-unibyte ()
   "Trim unibyte logs on whole-message boundaries."
   (let* ((msg1 (cons "A" "one"))
          (msg2 (cons "B" "two"))
          (msg3 (cons "C" "three"))
-         (log1 (acp-test--format-log-message msg1))
          (log2 (acp-test--format-log-message msg2))
          (log3 (acp-test--format-log-message msg3))
          (max-bytes (+ (string-bytes log2) (string-bytes log3)))
@@ -55,7 +79,6 @@
   (let* ((msg1 (cons "A" "alpha"))
          (msg2 (cons "B" "café ✓"))
          (msg3 (cons "C" "omega"))
-         (log1 (acp-test--format-log-message msg1))
          (log2 (acp-test--format-log-message msg2))
          (log3 (acp-test--format-log-message msg3))
          (chars-m2m3 (+ (length log2) (length log3)))
@@ -78,8 +101,8 @@
           :client client
           :request '((:method . "initialize"))
           :sync t))
-      (when-let ((process (map-elt client :process))
-                 ((process-live-p process)))
+      (when-let* ((process (map-elt client :process))
+                  ((process-live-p process)))
         (delete-process process)))))
 
 (defun acp-test--initialize-capabilities (&rest args)
@@ -268,6 +291,309 @@ schema check and disables the capability."
       (should-not (map-elt client :notification-handlers))
       (should-not (buffer-live-p logs))
       (should-not (buffer-live-p traffic)))))
+
+(ert-deftest acp-test-shutdown-lets-agent-handle-sigterm ()
+  "Send SIGTERM first, so the agent can stop the processes it started."
+  (let* ((marker (make-temp-file "acp-test-sigterm-"))
+         (client (acp-make-client
+                  :command "sh"
+                  :command-params
+                  (list "-c" (format "trap 'echo term > %1$s; exit 0' TERM; \
+echo ready > %1$s; while :; do sleep 0.05; done"
+                                     (shell-quote-argument marker)))))
+         (read-marker (lambda ()
+                        (with-temp-buffer
+                          (insert-file-contents marker)
+                          (buffer-string))))
+         process)
+    (unwind-protect
+        (progn
+          (acp--start-client :client client)
+          (setq process (map-elt client :process))
+          (with-timeout (2 (ert-fail "Agent did not start"))
+            (while (equal (funcall read-marker) "")
+              (accept-process-output nil 0.05)))
+          (acp-shutdown :client client)
+          (with-timeout (2 (ert-fail "Agent did not exit on SIGTERM"))
+            (while (process-live-p process)
+              (accept-process-output nil 0.05)))
+          (should (eq (process-status process) 'exit))
+          (should (equal (funcall read-marker) "term\n")))
+      (when (process-live-p process)
+        (delete-process process))
+      (delete-file marker))))
+
+(ert-deftest acp-test-shutdown-stops-agent-process-group ()
+  "Stop children in the agent's process group, even if the agent exits first."
+  (let* ((marker (make-temp-file "acp-test-group-"))
+         (client (acp-make-client
+                  :command "sh"
+                  :command-params
+                  (list "-c" (format "sleep 300 & echo $! > %s; wait"
+                                     (shell-quote-argument marker)))))
+         (acp--shutdown-grace-period 0.2)
+         child)
+    (unwind-protect
+        (progn
+          (acp--start-client :client client)
+          (with-timeout (2 (ert-fail "Agent did not start"))
+            (while (zerop (setq child (with-temp-buffer
+                                        (insert-file-contents marker)
+                                        (string-to-number (buffer-string)))))
+              (accept-process-output nil 0.05)))
+          (acp-shutdown :client client)
+          (with-timeout (2 (ert-fail "Child outlived shutdown"))
+            (while (zerop (signal-process child 0))
+              (accept-process-output nil 0.05))))
+      (when (and child (> child 0))
+        (ignore-errors (signal-process child 'SIGKILL)))
+      (delete-file marker))))
+
+(ert-deftest acp-test-session-list-request-omits-cursor-by-default ()
+  "Request the first page when no cursor is given."
+  (should (equal (acp-make-session-list-request :cwd "/tmp/")
+                 '((:method . "session/list")
+                   (:params . ((cwd . "/tmp")))))))
+
+(ert-deftest acp-test-session-list-request-includes-cursor ()
+  "Carry an opaque cursor into the next page request."
+  (should (equal (acp-make-session-list-request :cwd "/tmp/" :cursor "page-2")
+                 '((:method . "session/list")
+                   (:params . ((cwd . "/tmp")
+                               (cursor . "page-2")))))))
+
+(ert-deftest acp-test-session-list-request-without-cwd ()
+  "Serialize unfiltered requests with an empty params object."
+  (should (equal (acp--serialize-json (map-elt (acp-make-session-list-request) :params))
+                 "{}\n"))
+  (should (equal (acp-make-session-list-request :cursor "page-2")
+                 '((:method . "session/list")
+                   (:params . ((cursor . "page-2")))))))
+
+(defun acp-test--captured-filter (client)
+  "Start CLIENT with a stubbed process and return its `:filter'."
+  (let (filter)
+    (cl-letf (((symbol-function 'make-process)
+               (lambda (&rest args)
+                 (setq filter (plist-get args :filter))
+                 nil)))
+      (acp--start-client :client client))
+    filter))
+
+(defun acp-test--notification-line (n)
+  "Return a newline-terminated notification carrying number N."
+  (format "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"n\":%d}}\n" n))
+
+(defun acp-test--drain-until (predicate &optional timeout)
+  "Return non-nil once PREDICATE does, running timers for up to TIMEOUT seconds.
+
+TIMEOUT defaults to 1.  Returns nil if PREDICATE never held."
+  (let ((deadline (+ (float-time) (or timeout 1))))
+    (while (and (not (funcall predicate))
+                (< (float-time) deadline))
+      ;; The drain reschedules itself, so keep pumping rather than
+      ;; assuming a single timer runs everything.  A quitting handler
+      ;; signals through `accept-process-output', so contain it here.
+      (condition-case nil
+          (accept-process-output nil 0.02)
+        (quit nil)))
+    (funcall predicate)))
+
+(ert-deftest acp-test-drain-survives-quitting-notification-handler ()
+  "Keep routing queued messages after a handler exits non-locally."
+  (let* ((acp-logging-enabled nil)
+         (client (acp-make-client :command "cat"))
+         received filter)
+    (acp-subscribe-to-notifications
+     :client client
+     :on-notification (lambda (notification)
+                        (let ((n (map-nested-elt notification '(params n))))
+                          (push n received)
+                          ;; Stand in for C-g arriving mid-drain.
+                          (when (= n 2)
+                            (signal 'quit nil)))))
+    (unwind-protect
+        (progn
+          (setq filter (acp-test--captured-filter client))
+          (funcall filter nil (mapconcat #'acp-test--notification-line '(1 2 3 4) ""))
+          (acp-test--drain-until (lambda () (= (length received) 4)))
+          ;; 3 and 4 are queued behind the quitting handler: without a
+          ;; rescheduled drain they are never routed.
+          (should (equal (nreverse received) '(1 2 3 4))))
+      (acp-shutdown :client client))))
+
+(ert-deftest acp-test-drain-unwedges-queue-after-quitting-handler ()
+  "Route messages arriving after a handler exited non-locally."
+  (let* ((acp-logging-enabled nil)
+         (client (acp-make-client :command "cat"))
+         received filter)
+    (acp-subscribe-to-notifications
+     :client client
+     :on-notification (lambda (notification)
+                        (let ((n (map-nested-elt notification '(params n))))
+                          (push n received)
+                          (when (= n 1)
+                            (signal 'quit nil)))))
+    (unwind-protect
+        (progn
+          (setq filter (acp-test--captured-filter client))
+          (funcall filter nil (acp-test--notification-line 1))
+          (acp-test--drain-until (lambda () (= (length received) 1)))
+          ;; A stuck busy flag would swallow every later message.
+          (funcall filter nil (acp-test--notification-line 2))
+          (acp-test--drain-until (lambda () (= (length received) 2)))
+          (should (equal (nreverse received) '(1 2))))
+      (acp-shutdown :client client))))
+
+(ert-deftest acp-test-drain-survives-repeated-quitting-handler ()
+  "Drain the whole queue when every handler exits non-locally."
+  (let* ((acp-logging-enabled nil)
+         (client (acp-make-client :command "cat"))
+         received filter)
+    (acp-subscribe-to-notifications
+     :client client
+     :on-notification (lambda (notification)
+                        (push (map-nested-elt notification '(params n)) received)
+                        (signal 'quit nil)))
+    (unwind-protect
+        (progn
+          (setq filter (acp-test--captured-filter client))
+          (funcall filter nil (mapconcat #'acp-test--notification-line '(1 2 3 4 5) ""))
+          ;; Each exit drops its own message before rescheduling, so the
+          ;; queue shrinks instead of retrying the same message forever.
+          (acp-test--drain-until (lambda () (= (length received) 5)))
+          (should (equal (nreverse received) '(1 2 3 4 5))))
+      (acp-shutdown :client client))))
+
+(ert-deftest acp-test-drain-survives-unroutable-message ()
+  "Keep routing after a message that routing itself cannot handle.
+
+A JSON line that parses to something other than an object signals from
+the drain rather than from a handler, so no `condition-case' contains
+it."
+  (let* ((acp-logging-enabled nil)
+         (client (acp-make-client :command "cat"))
+         received filter)
+    (acp-subscribe-to-notifications
+     :client client
+     :on-notification (lambda (notification)
+                        (push (map-nested-elt notification '(params n)) received)))
+    (unwind-protect
+        (progn
+          (setq filter (acp-test--captured-filter client))
+          ;; Queued behind the unroutable message, 1 needs a rescheduled
+          ;; drain to reach a handler at all.
+          (funcall filter nil (concat "[1,2]\n" (acp-test--notification-line 1)))
+          ;; Routing the unroutable message signals, and the timer
+          ;; reports that.  Expected here, so keep it out of the logs.
+          (let ((inhibit-message t)
+                (message-log-max nil))
+            (acp-test--drain-until (lambda () (= (length received) 1))))
+          ;; And 2 needs the busy flag to have been cleared.
+          (funcall filter nil (acp-test--notification-line 2))
+          (acp-test--drain-until (lambda () (= (length received) 2)))
+          (should (equal (nreverse received) '(1 2))))
+      (acp-shutdown :client client))))
+
+(ert-deftest acp-test-drain-yields-between-batches ()
+  "Stop a drain once its time budget is spent, resuming on the next one.
+
+A backlog that outlasts the budget must be routed across several
+callbacks rather than one, so Emacs gets a chance to redisplay and read
+input in between."
+  (let* ((acp-logging-enabled nil)
+         (acp-drain-time-budget 0.01)
+         (client (acp-make-client :command "cat"))
+         (batch-sizes nil)
+         (routed 0)
+         received filter)
+    (acp-subscribe-to-notifications
+     :client client
+     :on-notification (lambda (notification)
+                        ;; Outlasts the budget, so the second message of
+                        ;; any batch is already over it.
+                        (sleep-for 0.02)
+                        (setq routed (1+ routed))
+                        (push (map-nested-elt notification '(params n)) received)))
+    (unwind-protect
+        (progn
+          (setq filter (acp-test--captured-filter client))
+          (advice-add 'timer-event-handler :around
+                      (lambda (orig &rest args)
+                        (let ((before routed))
+                          (apply orig args)
+                          (when (> routed before)
+                            (push (- routed before) batch-sizes))))
+                      '((name . acp-test-batch-sizes)))
+          (unwind-protect
+              (progn
+                (funcall filter nil (mapconcat #'acp-test--notification-line
+                                               '(1 2 3 4) ""))
+                (should (acp-test--drain-until
+                         (lambda () (= (length received) 4)) 3)))
+            (advice-remove 'timer-event-handler 'acp-test-batch-sizes))
+          ;; Order is preserved and nothing is dropped.
+          (should (equal (nreverse received) '(1 2 3 4)))
+          ;; The first handler spends the budget, so each drain routes
+          ;; one message and reschedules.
+          (should (equal batch-sizes '(1 1 1 1))))
+      (acp-shutdown :client client))))
+
+(ert-deftest acp-test-drain-routes-one-message-per-batch-minimum ()
+  "Route at least one message per drain however small the budget is.
+
+Testing the budget after routing (not before) is what keeps a zero
+budget from spinning on a queue it never advances."
+  (let* ((acp-logging-enabled nil)
+         (acp-drain-time-budget 0)
+         (client (acp-make-client :command "cat"))
+         received filter)
+    (acp-subscribe-to-notifications
+     :client client
+     :on-notification (lambda (notification)
+                        (push (map-nested-elt notification '(params n)) received)))
+    (unwind-protect
+        (progn
+          (setq filter (acp-test--captured-filter client))
+          (funcall filter nil (mapconcat #'acp-test--notification-line
+                                         '(1 2 3) ""))
+          (should (acp-test--drain-until (lambda () (= (length received) 3)) 3))
+          (should (equal (nreverse received) '(1 2 3))))
+      (acp-shutdown :client client))))
+
+(ert-deftest acp-test-drain-without-budget-empties-queue-in-one-batch ()
+  "Drain the whole queue in a single callback when the budget is nil."
+  (let* ((acp-logging-enabled nil)
+         (acp-drain-time-budget nil)
+         (client (acp-make-client :command "cat"))
+         (batch-sizes nil)
+         (routed 0)
+         received filter)
+    (acp-subscribe-to-notifications
+     :client client
+     :on-notification (lambda (notification)
+                        (setq routed (1+ routed))
+                        (push (map-nested-elt notification '(params n)) received)))
+    (unwind-protect
+        (progn
+          (setq filter (acp-test--captured-filter client))
+          (advice-add 'timer-event-handler :around
+                      (lambda (orig &rest args)
+                        (let ((before routed))
+                          (apply orig args)
+                          (when (> routed before)
+                            (push (- routed before) batch-sizes))))
+                      '((name . acp-test-batch-sizes)))
+          (unwind-protect
+              (progn
+                (funcall filter nil (mapconcat #'acp-test--notification-line
+                                               '(1 2 3 4 5) ""))
+                (should (acp-test--drain-until
+                         (lambda () (= (length received) 5)) 3)))
+            (advice-remove 'timer-event-handler 'acp-test-batch-sizes))
+          (should (equal (nreverse received) '(1 2 3 4 5)))
+          (should (equal batch-sizes '(5))))
+      (acp-shutdown :client client))))
 
 (provide 'acp-test)
 

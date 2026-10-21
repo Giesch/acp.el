@@ -115,6 +115,16 @@ The =*acp traffic*= is particularly useful to inspecting incomng or outgoing tra
 
 [[file:traffic.gif]]
 
+* Elicitation capabilities
+
+=acp-make-initialize-request= omits elicitation capabilities by default.
+Pass =:elicitation-form-capability t= to advertise form support,
+=:elicitation-url-capability t= to advertise URL support, or both.
+Advertise only modes the client can handle. Each supported mode is encoded
+as an empty JSON object, not a boolean.
+
+Use =acp-make-elicitation-create-response= to build form responses.
+
 * APIs
 
 #+BEGIN_SRC emacs-lisp :results table :colnames '("Function" "Type" "Description") :exports results
